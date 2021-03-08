@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Sample Step Functions with dotnetcore
+Globals:
+  Function:
+    Timeout: 900
+
+Resources:
+  
+  # Dynamo DB table used for storing documents from lambda function
+  ExampleTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      TableName: example_table
+        
+  # This function can be called to start a state machine. 
+  # It returns immediately after the state machine is started. 
+  # This function is exposed in the API Gateway, allowing it to be called by other applications
+  # This demonstrates one approach (another method could be to triggering it from an S3 upload)
+  EndpointFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: StateMachine
+    Properties:
+      Handler: index.handler
+      Runtime: python3.8      
+      InlineCode: !Sub |
+        import boto3
+        import json
+        def handler(event, context):
+          print(json.dumps(event))
+          client = boto3.client('stepfunctions')
+          response = client.start_execution(
+                      stateMachineArn='${StateMachine}',
+                      input=json.dumps(event))
+          return {
+              'statusCode': 200,
+              'body': json.dumps(
+                {'request_id': response['ResponseMetadata']['RequestId'],
+                 'execution_arn': response['executionArn']})
+          }
+      Role: !GetAtt 'EndpointFunctionRole.Arn'
+      Timeout: 60
+      Events:
+        StateMachineEndpoint:
+          Type: Api
+          Properties:
+            Path: /steps
+            Method: get
+
+  # This role allows the state machine function to execute
+  # the state machine
+  EndpointFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'      
+      Policies:
+        - PolicyName: gw-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 'states:StartExecution'
+                Resource: ["*"]              
+              - Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: ["*"]
+                  
+  # This state machine simply takes the input from the API call,
+  # converts it to lower-case, then passes it to the last
+  # lambda function, where it is written to a dynamo db table
+  StateMachine:
+    Type: 'AWS::Serverless::StateMachine'
+    Properties:
+      Definition:
+        StartAt: 'Lowercase'
+        States:
+          Lowercase:
+            Type: Task
+            Resource: !GetAtt LowercaseFunction.Arn
+            Next: WriteToDynamo
+          WriteToDynamo:
+            Type: Task
+            Resource: !GetAtt DynamoWriterFunction.Arn
+            End: true              
+      Role: !GetAtt 'StateMachineRole.Arn'
+      
+  StateMachineRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'states.${AWS::Region}.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: sm-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 'lambda:InvokeFunction'
+                Resource: ["*"]
+
+
+  LowercaseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/HelloWorld/
+      Handler: HelloWorld::HelloWorld.Lowercase::FunctionHandler
+      Runtime: dotnetcore3.1
+            
+  DynamoWriterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/HelloWorld/
+      Handler: HelloWorld::HelloWorld.DynamoWriter::FunctionHandler
+      Runtime: dotnetcore3.1
+      Role: !GetAtt 'DynamoWriterFunctionRole.Arn'
+
+  DynamoWriterFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: dynamo-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 'dynamodb:*'
+                Resource: ["*"]
+              - Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: [ "*" ]    
+      
+Outputs:
+  LowercaseFunction:
+    Description: "Hello World Lambda Function ARN"
+    Value: !GetAtt LowercaseFunction.Arn
+  LowercaseFunctionRole:
+    Description: "Implicit IAM Role created for lowercase function"
+    Value: !GetAtt LowercaseFunctionRole.Arn
+  DynamoWriterFunction:
+    Description: "Dynamo Writer Lambda Function ARN"
+    Value: !GetAtt DynamoWriterFunction.Arn
+  DynamoWriterFunctionRole:
+    Description: "Implicit IAM Role created for Dynamo Writer function"
+    Value: !GetAtt DynamoWriterFunctionRole.Arn
+  # API endpoint
+  EndpointFunctionApi:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/steps/"
+  EndpointFunction:
+    Description: "Endpoint Function ARN"
+    Value: !GetAtt DynamoWriterFunction.Arn
